@@ -2,7 +2,7 @@
 [plugin]
 min_astra_version = "0.2.7"
 id = "telegram-voice"
-version = "0.1.9"
+version = "0.1.10"
 name = "Astra Telegram Assistant"
 description = "Telegram integration for the Astra local AI assistant. Receives messages, checks user access by Telegram @username, forwards messages to Astra, and automatically sends replies back to Telegram. Supports voice playback of assistant replies."
 author = "YaniChap"
