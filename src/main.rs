@@ -6,7 +6,6 @@ use grammers_tl_types as tl;
 use qrcode::{QrCode, render::svg};
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -17,13 +16,11 @@ use grammers_client::client::{LoginToken, PasswordToken};
 use grammers_client::session::types::{ChannelState, UpdateState};
 use grammers_client::session::{BoxFuture, Session, SessionData};
 
-use windows_sys::Win32::Storage::FileSystem::{
-    MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
-};
-
 use astra_plugin_sdk::prelude::*;
 use std::collections::{HashMap, VecDeque};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::LocalFree;
+#[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
     CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
 };
@@ -1252,6 +1249,7 @@ fn parse_clock(value: &str) -> Option<u16> {
 
 /// Schedule is evaluated against the Windows machine's local clock. Invalid
 /// schedule data fails closed, never silently opening the auto-send window.
+#[cfg(windows)]
 fn automation_window_open(settings: &VoiceSettings) -> bool {
     if !settings.schedule_enabled {
         return true;
@@ -1297,6 +1295,14 @@ fn automation_window_open(settings: &VoiceSettings) -> bool {
     } else {
         now >= start || now < end
     }
+}
+
+// The official release workflow also compiles Rust plugins on Linux. This
+// target is not supported at runtime (plugin.toml is Windows-only), so fail
+// closed rather than pretending the Linux host's clock is the Windows clock.
+#[cfg(not(windows))]
+fn automation_window_open(_settings: &VoiceSettings) -> bool {
+    false
 }
 
 fn processed_ids_path() -> anyhow::Result<PathBuf> {
@@ -1561,6 +1567,43 @@ fn load_voice_settings() -> anyhow::Result<VoiceSettings> {
     Ok(settings)
 }
 
+// Keep replacement atomic on Windows, while allowing the trusted Linux
+// release leg to compile the same source tree.
+#[cfg(windows)]
+fn replace_file_atomically(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+    };
+
+    let source_wide: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination_wide: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+
+    let result = unsafe {
+        MoveFileExW(
+            source_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+
+    if result == 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file_atomically(source: &Path, destination: &Path) -> anyhow::Result<()> {
+    fs::rename(source, destination)?;
+    Ok(())
+}
+
 fn save_voice_settings(settings: &VoiceSettings) -> anyhow::Result<()> {
     let path = voice_settings_path()?;
     let json = serde_json::to_vec_pretty(settings)?;
@@ -1587,30 +1630,9 @@ fn save_voice_settings(settings: &VoiceSettings) -> anyhow::Result<()> {
         return Err(error);
     }
 
-    let source: Vec<u16> = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let destination: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-
-    if result == 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = replace_file_atomically(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(error.into());
+        return Err(error);
     }
 
     Ok(())
@@ -1812,6 +1834,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
     })
 }
 
+#[cfg(windows)]
 fn dpapi_encrypt(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     unsafe {
         let mut input = CRYPT_INTEGER_BLOB {
@@ -1844,6 +1867,11 @@ fn dpapi_encrypt(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
         Ok(encrypted)
     }
+}
+
+#[cfg(not(windows))]
+fn dpapi_encrypt(_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("Telegram session encryption is supported only on Windows")
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -2035,30 +2063,9 @@ fn save_encrypted_session(path: &Path, data: &PersistedSessionData) -> anyhow::R
         return Err(error);
     }
 
-    let source: Vec<u16> = temp_path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let destination: Vec<u16> = path
-        .as_os_str()
-        .encode_wide()
-        .chain(std::iter::once(0))
-        .collect();
-
-    let result = unsafe {
-        MoveFileExW(
-            source.as_ptr(),
-            destination.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-
-    if result == 0 {
-        let error = std::io::Error::last_os_error();
+    if let Err(error) = replace_file_atomically(&temp_path, &path) {
         let _ = fs::remove_file(&temp_path);
-        return Err(error.into());
+        return Err(error);
     }
 
     Ok(())
@@ -2078,6 +2085,7 @@ fn load_encrypted_session(path: &Path) -> anyhow::Result<PersistedSessionData> {
     Ok(data)
 }
 
+#[cfg(windows)]
 fn dpapi_decrypt(data: &[u8]) -> anyhow::Result<Vec<u8>> {
     let data_len =
         u32::try_from(data.len()).map_err(|_| anyhow::anyhow!("Encrypted data is too large"))?;
@@ -2121,6 +2129,11 @@ fn dpapi_decrypt(data: &[u8]) -> anyhow::Result<Vec<u8>> {
 
         decrypted
     }
+}
+
+#[cfg(not(windows))]
+fn dpapi_decrypt(_data: &[u8]) -> anyhow::Result<Vec<u8>> {
+    anyhow::bail!("Telegram session decryption is supported only on Windows")
 }
 
 #[derive(Default)]
