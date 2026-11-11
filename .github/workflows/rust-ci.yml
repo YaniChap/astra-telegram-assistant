@@ -27,5 +27,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install --yes protobuf-compiler
+      - name: Install protobuf compiler (Windows)
+        if: runner.os == 'Windows'
+        run: choco install protoc --yes --no-progress
       - name: Run tests
         run: cargo test --locked --all-targets

@@ -2739,11 +2739,11 @@ impl AstraTelegramVoice {
     #[hook]
     async fn on_start(&self, ctx: &PluginContext) -> anyhow::Result<()> {
         self.bot_shutdown.store(false, Ordering::Relaxed);
-        let ctx = ctx.clone();
+        let bot_ctx = ctx.clone();
         let stop = self.bot_shutdown.clone();
         let telegram = self.telegram.clone();
         let task = tokio::spawn(async move {
-            telegram_bot_poll_loop(ctx, telegram, stop).await;
+            telegram_bot_poll_loop(bot_ctx, telegram, stop).await;
         });
         *self.bot_task.lock().await = Some(task);
 
@@ -4949,6 +4949,7 @@ mod dpapi_tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn corrupted_session_file_is_rejected() {
         let path = std::env::temp_dir().join("astra_telegram_voice_corrupted_test.dat");
 
@@ -4983,6 +4984,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn unsupported_session_version_is_rejected() {
         let path = std::env::temp_dir().join("astra_telegram_voice_version_test.dat");
 
@@ -5007,6 +5009,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn encrypted_session_file_round_trip() {
         let path = std::env::temp_dir().join("astra_telegram_voice_test_session.dat");
 
@@ -5056,6 +5059,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn dpapi_round_trip() {
         let original = b"astra-dpapi-test";
 

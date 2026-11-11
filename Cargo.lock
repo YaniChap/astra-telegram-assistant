@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "astra_telegram_voice"
-version = "0.1.12"
+version = "0.1.13"
 dependencies = [
  "astra-plugin-sdk",
  "base64 0.22.1",
