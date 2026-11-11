@@ -16,7 +16,7 @@ on:
     # another plugin's tag, where it fails the version assertion; a glob
     # narrower than it never starts at all, and a release that silently does
     # nothing is the worst of the two.
-    tags: ["v*"]
+    tags: ["[0-9]*"]
 
 # Required, and required HERE: a reusable workflow can only reduce the
 # permissions its caller granted, never grant itself more. Leave all three.
@@ -31,11 +31,11 @@ jobs:
     # in mihailinl/AstraPlugins would otherwise own the build step of every plugin
     # that trusts it — and that build step runs in YOUR repository with the
     # token above. `astra-plugin init-ci` keeps this line current.
-    uses: mihailinl/AstraPlugins/.github/workflows/plugin-release.yml@b6e9140d53060585c70280e979b58202f34966ba  # plugin-release/v1
+    uses: ./.github/workflows/astra-plugin-release.yml
     with:
       plugin-dir: .
       # The tag that releases THIS plugin, and nothing else in this repository.
-      tag-prefix: "v"
+      tag-prefix: ""
       # Extra apt packages the Linux build needs, e.g. "libasound2-dev pkg-config".
       linux-packages: ""
     # No `secrets: inherit`, deliberately. This workflow declares no secrets,
