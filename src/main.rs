@@ -4949,6 +4949,7 @@ mod dpapi_tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn corrupted_session_file_is_rejected() {
         let path = std::env::temp_dir().join("astra_telegram_voice_corrupted_test.dat");
 
@@ -4983,6 +4984,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn unsupported_session_version_is_rejected() {
         let path = std::env::temp_dir().join("astra_telegram_voice_version_test.dat");
 
@@ -5007,6 +5009,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn encrypted_session_file_round_trip() {
         let path = std::env::temp_dir().join("astra_telegram_voice_test_session.dat");
 
@@ -5056,6 +5059,7 @@ mod dpapi_tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn dpapi_round_trip() {
         let original = b"astra-dpapi-test";
 
