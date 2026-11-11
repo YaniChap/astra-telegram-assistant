@@ -2603,6 +2603,47 @@ fn reconnect_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
+async fn transcribe_telegram_voice_message(
+    runtime: &TelegramRuntime,
+    chat_id: &str,
+    message_id: i64,
+) -> anyhow::Result<String> {
+    let peer_id = runtime.peer_ids.lock().await.get(chat_id).cloned()
+        .ok_or_else(|| anyhow::anyhow!("Не найден Telegram-чат для голосового сообщения."))?;
+    let peer = runtime.session.peer_ref(peer_id).await?
+        .ok_or_else(|| anyhow::anyhow!("Не удалось восстановить Telegram-чат."))?;
+    let mut iterator = runtime.client.iter_messages(peer).limit(100);
+    let mut target = None;
+    loop {
+        match iterator.next().await? {
+            Some(message) if i64::from(message.id()) == message_id => {
+                target = Some(message);
+                break;
+            }
+            Some(_) => {}
+            None => break,
+        }
+    }
+    let message = target.ok_or_else(|| anyhow::anyhow!("Голосовое сообщение не найдено в последних 100 сообщениях."))?;
+    let media_debug = message.media().map(|media| format!("{media:?}")).unwrap_or_default().to_ascii_lowercase();
+    if !(media_debug.contains("voice: true") || media_debug.contains("voice(true)") || media_debug.contains("voice_note")) {
+        anyhow::bail!("Сообщение не распознано как голосовая заметка.");
+    }
+    let sequence = SESSION_TEMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let path = std::env::temp_dir().join(format!("astra-tg-incoming-voice-{}-{message_id}-{sequence}.ogg", std::process::id()));
+    let downloaded = message.download_media(&path).await?;
+    if !downloaded {
+        anyhow::bail!("Telegram не вернул аудиофайл.");
+    }
+    let bytes_result = fs::read(&path);
+    let _ = fs::remove_file(&path);
+    let bytes = bytes_result?;
+    if bytes.is_empty() || bytes.len() > 10 * 1024 * 1024 {
+        anyhow::bail!("Голосовое пустое или превышает лимит 10 МБ.");
+    }
+    speech_transcribe(bytes).await
+}
+
 async fn telegram_incoming_speech_loop(
     ctx: PluginContext,
     telegram: Arc<tokio::sync::Mutex<TelegramConnectionState>>,
@@ -2656,8 +2697,23 @@ async fn telegram_incoming_speech_loop(
 
         let sender = item.get("sender").and_then(serde_json::Value::as_str)
             .filter(|value| !value.trim().is_empty()).unwrap_or("неизвестный отправитель");
-        let body = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+        let mut body = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("").trim().to_string();
         let is_voice = item.get("is_voice").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        if is_voice && body.is_empty() {
+            let chat_id = item.get("chat_id").and_then(serde_json::Value::as_str).unwrap_or("");
+            let message_id = item.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+            if message_id > 0 {
+                match transcribe_telegram_voice_message(&runtime, chat_id, message_id).await {
+                    Ok(transcription) => body = format!("Голосовое сообщение: {transcription}"),
+                    Err(error) => {
+                        eprintln!("Telegram incoming voice transcription failed: {error}");
+                        body = "Пришло голосовое сообщение, но его не удалось расшифровать.".to_string();
+                    }
+                }
+            } else {
+                body = "Пришло голосовое сообщение.".to_string();
+            }
+        }
         let announcement = if !body.is_empty() {
             format!("Новое сообщение от {sender}. {body}")
         } else if is_voice {
