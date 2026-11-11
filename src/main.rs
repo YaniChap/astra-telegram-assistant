@@ -2771,7 +2771,7 @@ impl AstraTelegramVoice {
         Ok(serde_json::json!({"status":messages.get("status").cloned().unwrap_or(serde_json::json!("error")),"contact":contacts[0],"messages":messages.get("messages").cloned().unwrap_or(serde_json::json!([])),"message":messages.get("message").cloned()}).to_string())
     }
 
-    /// Отправляет личное сообщение. Если получатель неоднозначен, ничего не отправляет и просит уточнить контакт.
+    /// Отправляет личное сообщение. Вызывай этот инструмент только после явного подтверждения пользователя для указанного получателя и точного текста. При неоднозначном получателе ничего не отправляет.
     #[tool]
     async fn telegram_send_message(&self, args: TelegramSendMessageArgs) -> Result<String, ToolError> {
         let text = args.text.trim();
@@ -2804,7 +2804,26 @@ impl AstraTelegramVoice {
             return Ok(serde_json::json!({"status":"not_authorized","message":"Telegram требует авторизации."}).to_string());
         }
         let history = runtime.incoming_history.lock().await;
-        let messages: Vec<serde_json::Value> = history.iter().rev().take(20).cloned().collect();
+        let mut messages: Vec<serde_json::Value> = history.iter().rev().take(20).cloned().collect();
+        drop(history);
+        for item in &mut messages {
+            let is_voice = item.get("is_voice").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let text_empty = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("").trim().is_empty();
+            if is_voice && text_empty {
+                let chat_id = item.get("chat_id").and_then(serde_json::Value::as_str).unwrap_or("");
+                let message_id = item.get("id").and_then(serde_json::Value::as_i64).unwrap_or(0);
+                let transcription = self.telegram_transcribe_voice(
+                    serde_json::json!({"chat_id":chat_id,"message_id":message_id}).to_string()
+                ).await?;
+                let transcription: serde_json::Value = serde_json::from_str(&transcription).unwrap_or_default();
+                if transcription.get("status").and_then(serde_json::Value::as_str) == Some("ok") {
+                    item["text"] = transcription.get("text").cloned().unwrap_or(serde_json::Value::String(String::new()));
+                    item["transcribed"] = serde_json::Value::Bool(true);
+                } else {
+                    item["transcription_error"] = transcription.get("message").cloned().unwrap_or(serde_json::Value::String("Не удалось расшифровать голосовое сообщение.".into()));
+                }
+            }
+        }
         Ok(serde_json::json!({"status":"ok","count":messages.len(),"messages":messages}).to_string())
     }
 
