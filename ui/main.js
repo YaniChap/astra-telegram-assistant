@@ -1334,21 +1334,8 @@ function settingsContent() {
           state.replyDraft = item.draft || '';
           if (item.draft_error) state.notificationStatus = `Черновик не создан: ${item.draft_error}`;
           render();
-          // Голосом уведомляем владельца о новом сообщении и спрашиваем,
-          // какой ответ отправить. Сам Telegram-бот остаётся текстовым.
-          const sender = String(item.sender || 'Неизвестный отправитель').trim();
-          const incoming = String(item.text || (item.is_voice ? 'Голосовое сообщение без распознанного текста.' : 'Сообщение без текста.')).trim();
-          const announcement = `Новое сообщение от ${sender}. ${incoming.slice(0, 900)}. Что ответить?`;
-          try {
-            const speech = await backend('telegram_speak_astra', { text: announcement });
-            if (speech.status !== 'ok') {
-              state.notificationStatus = speech.message || 'Не удалось озвучить новое сообщение через Astra.';
-              render();
-            }
-          } catch (speechError) {
-            state.notificationStatus = speechError.message || 'Не удалось озвучить новое сообщение через Astra.';
-            render();
-          }
+          // Озвучивание выполняется отдельным фоновым worker в Rust.
+          // UI только показывает карточку и не произносит уведомление повторно.
         }
       } else if (result.status === 'not_authorized') {
         state.notificationStatus = 'Telegram не авторизован. Переподключи аккаунт в разделе подключения.';
