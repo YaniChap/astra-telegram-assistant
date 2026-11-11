@@ -2739,11 +2739,11 @@ impl AstraTelegramVoice {
     #[hook]
     async fn on_start(&self, ctx: &PluginContext) -> anyhow::Result<()> {
         self.bot_shutdown.store(false, Ordering::Relaxed);
-        let ctx = ctx.clone();
+        let bot_ctx = ctx.clone();
         let stop = self.bot_shutdown.clone();
         let telegram = self.telegram.clone();
         let task = tokio::spawn(async move {
-            telegram_bot_poll_loop(ctx, telegram, stop).await;
+            telegram_bot_poll_loop(bot_ctx, telegram, stop).await;
         });
         *self.bot_task.lock().await = Some(task);
 
