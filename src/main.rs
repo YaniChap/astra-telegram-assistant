@@ -35,6 +35,26 @@ use grammers_client::{
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[astra::args]
+struct TelegramSearchContactsArgs {
+    /// Имя, фамилия или username контакта; можно указать username с @.
+    query: String,
+}
+
+#[astra::args]
+struct TelegramReadMessagesArgs {
+    /// Имя или username одного личного диалога.
+    chat: String,
+}
+
+#[astra::args]
+struct TelegramSendMessageArgs {
+    /// Имя или username одного личного получателя.
+    recipient: String,
+    /// Точный текст личного сообщения для отправки.
+    text: String,
+}
+
 fn telegram_session_path() -> anyhow::Result<PathBuf> {
     let local_app_data = std::env::var_os("LOCALAPPDATA")
         .ok_or_else(|| anyhow::anyhow!("LOCALAPPDATA is not available"))?;
@@ -1660,6 +1680,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
     let qr = Arc::new(tokio::sync::Mutex::new(TelegramQrState::default()));
     let peer_ids = Arc::new(tokio::sync::Mutex::new(HashMap::<String, PeerId>::new()));
     let notifications = Arc::new(tokio::sync::Mutex::new(VecDeque::<serde_json::Value>::new()));
+    let incoming_history = Arc::new(tokio::sync::Mutex::new(VecDeque::<serde_json::Value>::new()));
     // Update streams can replay the same Telegram message after reconnect. Keep a
     // bounded per-chat id window so a replay cannot create a second draft/reply.
     let seen_incoming = Arc::new(tokio::sync::Mutex::new(load_processed_ids()));
@@ -1672,6 +1693,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
     let qr_for_updates = Arc::clone(&qr);
     let peers_for_updates = Arc::clone(&peer_ids);
     let notifications_for_updates = Arc::clone(&notifications);
+    let history_for_updates = Arc::clone(&incoming_history);
     let seen_for_updates = Arc::clone(&seen_incoming);
 
     // Запускаем сетевой runner.
@@ -1763,23 +1785,33 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
                                         };
                                         if duplicate { continue; }
 
-                                        // Уведомления выключены по умолчанию. При включении
-                                        // сохраняем только ограниченную очередь для UI.
+                                        let text = message.text().to_string();
+                                        let media_debug = message.media().map(|media| format!("{media:?}")).unwrap_or_default().to_ascii_lowercase();
+                                        let is_voice = media_debug.contains("voice: true") || media_debug.contains("voice(true)") || media_debug.contains("voice_note");
+                                        let notification = serde_json::json!({
+                                            "id": message_id,
+                                            "chat_id": chat_id,
+                                            "sender": sender_label,
+                                            "text": text,
+                                            "is_voice": is_voice,
+                                            "outgoing": false,
+                                        });
+
+                                        // Keep a separate bounded, read-only history for AI tools.
+                                        // The UI notification queue may be consumed independently.
+                                        {
+                                            let mut history = history_for_updates.lock().await;
+                                            history.push_back(notification.clone());
+                                            while history.len() > 100 {
+                                                history.pop_front();
+                                            }
+                                        }
+
+                                        // UI prompts remain opt-in and use their own queue.
                                         let assistant_enabled = load_voice_settings()
                                             .map(|settings| settings.message_assistant_enabled)
                                             .unwrap_or(false);
                                         if assistant_enabled {
-                                            let text = message.text().to_string();
-                                            let media_debug = message.media().map(|media| format!("{media:?}")).unwrap_or_default().to_ascii_lowercase();
-                                            let is_voice = media_debug.contains("voice: true") || media_debug.contains("voice(true)") || media_debug.contains("voice_note");
-                                            let notification = serde_json::json!({
-                                                "id": message_id,
-                                                "chat_id": chat_id,
-                                                "sender": sender_label,
-                                                "text": text,
-                                                "is_voice": is_voice,
-                                                "outgoing": false,
-                                            });
                                             let mut queue = notifications_for_updates.lock().await;
                                             queue.push_back(notification);
                                             while queue.len() > 100 {
@@ -1828,6 +1860,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
         qr,
         peer_ids,
         notifications,
+        incoming_history,
         seen_incoming,
         auto_reply_history,
         auto_reply_cycle_history,
@@ -2162,6 +2195,7 @@ struct TelegramRuntime {
     qr: Arc<tokio::sync::Mutex<TelegramQrState>>,
     peer_ids: Arc<tokio::sync::Mutex<HashMap<String, PeerId>>>,
     notifications: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
+    incoming_history: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
     seen_incoming: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<i32>>>>,
     auto_reply_history: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<SystemTime>>>>,
     auto_reply_cycle_history:
@@ -2678,6 +2712,100 @@ impl AstraTelegramVoice {
                 Ok("При остановке Telegram runtime произошла ошибка.".into())
             }
         }
+    }
+
+    /// Находит личные Telegram-диалоги по имени или username. При нескольких совпадениях возвращает список для уточнения.
+    #[tool]
+    async fn telegram_search_contacts(&self, args: TelegramSearchContactsArgs) -> Result<String, ToolError> {
+        let query = args.query.trim().trim_start_matches('@').to_lowercase();
+        if query.is_empty() {
+            return Ok(serde_json::json!({"status":"invalid_query","message":"Укажи имя или username контакта."}).to_string());
+        }
+        let raw = self.telegram_list_dialogs().await?;
+        let value: serde_json::Value = serde_json::from_str(&raw).unwrap_or_default();
+        if value.get("status").and_then(serde_json::Value::as_str) != Some("ok") {
+            return Ok(raw);
+        }
+        let chats = value.get("chats").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        let private_chats: Vec<serde_json::Value> = chats.into_iter().filter(|chat| {
+            chat.get("is_user").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        }).collect();
+        let exact: Vec<serde_json::Value> = private_chats.iter().filter(|chat| {
+            let title = chat.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_lowercase();
+            let username = chat.get("username").and_then(serde_json::Value::as_str).unwrap_or("").trim_start_matches('@').to_lowercase();
+            title == query || username == query
+        }).cloned().collect();
+        let matches: Vec<serde_json::Value> = if exact.is_empty() {
+            private_chats.into_iter().filter(|chat| {
+                let title = chat.get("title").and_then(serde_json::Value::as_str).unwrap_or("").to_lowercase();
+                let username = chat.get("username").and_then(serde_json::Value::as_str).unwrap_or("").trim_start_matches('@').to_lowercase();
+                title.contains(&query) || username.contains(&query)
+            }).take(10).collect()
+        } else {
+            exact
+        };
+        Ok(serde_json::json!({
+            "status":"ok",
+            "query":args.query,
+            "count":matches.len(),
+            "contacts":matches
+        }).to_string())
+    }
+
+    /// Читает последние сообщения одного личного Telegram-диалога по имени или username.
+    #[tool]
+    async fn telegram_read_messages(&self, args: TelegramReadMessagesArgs) -> Result<String, ToolError> {
+        let search = self.telegram_search_contacts(TelegramSearchContactsArgs { query: args.chat.clone() }).await?;
+        let value: serde_json::Value = serde_json::from_str(&search).unwrap_or_default();
+        let contacts = value.get("contacts").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        if contacts.len() != 1 {
+            return Ok(serde_json::json!({
+                "status": if contacts.is_empty() { "contact_not_found" } else { "ambiguous_contact" },
+                "message": if contacts.is_empty() { "Личный диалог не найден." } else { "Найдено несколько диалогов. Уточни имя или username." },
+                "contacts":contacts
+            }).to_string());
+        }
+        let chat_id = contacts[0].get("id").and_then(serde_json::Value::as_str).unwrap_or("");
+        let history = self.telegram_get_messages(serde_json::json!({"chat_id":chat_id}).to_string()).await?;
+        let messages: serde_json::Value = serde_json::from_str(&history).unwrap_or_default();
+        Ok(serde_json::json!({"status":messages.get("status").cloned().unwrap_or(serde_json::json!("error")),"contact":contacts[0],"messages":messages.get("messages").cloned().unwrap_or(serde_json::json!([])),"message":messages.get("message").cloned()}).to_string())
+    }
+
+    /// Отправляет личное сообщение. Если получатель неоднозначен, ничего не отправляет и просит уточнить контакт.
+    #[tool]
+    async fn telegram_send_message(&self, args: TelegramSendMessageArgs) -> Result<String, ToolError> {
+        let text = args.text.trim();
+        if text.is_empty() {
+            return Ok(serde_json::json!({"status":"empty_message","message":"Текст сообщения пуст."}).to_string());
+        }
+        let search = self.telegram_search_contacts(TelegramSearchContactsArgs { query: args.recipient.clone() }).await?;
+        let value: serde_json::Value = serde_json::from_str(&search).unwrap_or_default();
+        let contacts = value.get("contacts").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+        if contacts.len() != 1 {
+            return Ok(serde_json::json!({
+                "status": if contacts.is_empty() { "recipient_not_found" } else { "ambiguous_recipient" },
+                "message": if contacts.is_empty() { "Личный получатель не найден. Сообщение не отправлено." } else { "Найдено несколько контактов. Уточни получателя; сообщение не отправлено." },
+                "contacts":contacts
+            }).to_string());
+        }
+        let chat_id = contacts[0].get("id").and_then(serde_json::Value::as_str).unwrap_or("");
+        self.telegram_send_text(serde_json::json!({"chat_id":chat_id,"text":text}).to_string()).await
+    }
+
+    /// Возвращает последние входящие личные сообщения, полученные с момента запуска Telegram runtime. Не помечает их прочитанными и не отправляет ответы.
+    #[tool]
+    async fn telegram_check_incoming_messages(&self) -> Result<String, ToolError> {
+        let status = self.telegram_status().await?;
+        let runtime = self.telegram.lock().await.runtime.clone();
+        let Some(runtime) = runtime else {
+            return Ok(serde_json::json!({"status":"not_connected","message":status}).to_string());
+        };
+        if !runtime.client.is_authorized().await.unwrap_or(false) {
+            return Ok(serde_json::json!({"status":"not_authorized","message":"Telegram требует авторизации."}).to_string());
+        }
+        let history = runtime.incoming_history.lock().await;
+        let messages: Vec<serde_json::Value> = history.iter().rev().take(20).cloned().collect();
+        Ok(serde_json::json!({"status":"ok","count":messages.len(),"messages":messages}).to_string())
     }
 
     /// Выполняет выход из Telegram и удаляет локальную сессию.
@@ -3445,6 +3573,13 @@ impl AstraTelegramVoice {
             let id = format!("{peer_id:?}");
             peer_ids.insert(id.clone(), peer_id);
             let title = dialog.peer().name().unwrap_or("Telegram чат").to_string();
+            let (username, is_user) = match dialog.peer() {
+                grammers_client::peer::Peer::User(user) => (
+                    user.username().unwrap_or_default().to_string(),
+                    true,
+                ),
+                _ => (String::new(), false),
+            };
             let last_message = dialog
                 .last_message
                 .as_ref()
@@ -3455,6 +3590,8 @@ impl AstraTelegramVoice {
             items.push(serde_json::json!({
                 "id": id,
                 "title": title,
+                "username": username,
+                "is_user": is_user,
                 "last_message": last_message,
             }));
 
