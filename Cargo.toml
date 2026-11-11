@@ -1,6 +1,6 @@
 [package]
 name = "astra_telegram_voice"
-version = "0.1.9-dev.5"
+version = "0.1.9"
 edition = "2024"
 
 

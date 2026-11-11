@@ -22,3 +22,8 @@ subscribe_events = { reason = "Receives Astra events required for plugin operati
 send_chat_message = { reason = "Sends recent Telegram message context to Astra AI to generate reply drafts" }
 push_to_ui = { reason = "Displays plugin status and controls" }
 client = { reason = "Requests speech through Astra’s configured voice engine when the daemon permits plugin client access" }
+
+
+[platform]
+os = ["windows"]
+arch = ["x86_64"]
