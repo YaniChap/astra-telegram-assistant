@@ -1,0 +1,24 @@
+
+[plugin]
+min_astra_version = "0.2.7"
+id = "telegram-voice"
+version = "0.1.9"
+name = "Astra Telegram Assistant"
+description = "Telegram integration for the Astra local AI assistant. Receives messages, checks user access by Telegram @username, forwards messages to Astra, and automatically sends replies back to Telegram. Supports voice playback of assistant replies."
+author = "YaniChap"
+license = "MIT"
+
+[entry]
+command = "target/release/astra_telegram_voice"
+
+[capabilities]
+tools = true
+client = true
+ui_contributions = true
+event_handlers = true
+
+[permissions]
+subscribe_events = { reason = "Receives Astra events required for plugin operation" }
+send_chat_message = { reason = "Sends recent Telegram message context to Astra AI to generate reply drafts" }
+push_to_ui = { reason = "Displays plugin status and controls" }
+client = { reason = "Requests speech through Astra’s configured voice engine when the daemon permits plugin client access" }

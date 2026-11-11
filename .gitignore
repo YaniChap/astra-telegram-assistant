@@ -1,0 +1,10 @@
+target/
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+secrets/
+
+*.astraplugin
+verification/*.log
