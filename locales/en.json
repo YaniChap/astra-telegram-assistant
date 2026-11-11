@@ -1,4 +1,4 @@
 {
-  "listing.name": "Astra Telegram Assistant",
-  "listing.description": "Telegram integration for the Astra local AI assistant. Receives messages, checks user access by Telegram @username, forwards messages to Astra, and automatically sends replies back to Telegram. Supports voice playback of assistant replies."
+  "listing.description": "Telegram integration for the Astra local AI assistant. Receives messages, checks user access by Telegram @username, forwards messages to Astra, and automatically sends replies back to Telegram. Supports voice playback of assistant replies.",
+  "listing.name": "Voice Message Assistant"
 }
