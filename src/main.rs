@@ -1681,6 +1681,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
     let peer_ids = Arc::new(tokio::sync::Mutex::new(HashMap::<String, PeerId>::new()));
     let notifications = Arc::new(tokio::sync::Mutex::new(VecDeque::<serde_json::Value>::new()));
     let incoming_history = Arc::new(tokio::sync::Mutex::new(VecDeque::<serde_json::Value>::new()));
+    let speech_notifications = Arc::new(tokio::sync::Mutex::new(VecDeque::<serde_json::Value>::new()));
     // Update streams can replay the same Telegram message after reconnect. Keep a
     // bounded per-chat id window so a replay cannot create a second draft/reply.
     let seen_incoming = Arc::new(tokio::sync::Mutex::new(load_processed_ids()));
@@ -1694,6 +1695,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
     let peers_for_updates = Arc::clone(&peer_ids);
     let notifications_for_updates = Arc::clone(&notifications);
     let history_for_updates = Arc::clone(&incoming_history);
+    let speech_for_updates = Arc::clone(&speech_notifications);
     let seen_for_updates = Arc::clone(&seen_incoming);
 
     // Запускаем сетевой runner.
@@ -1812,6 +1814,15 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
                                             .map(|settings| settings.message_assistant_enabled)
                                             .unwrap_or(false);
                                         if assistant_enabled {
+                                            // Independent queue: the UI may be closed or may consume
+                                            // its own notification queue before the background TTS worker.
+                                            {
+                                                let mut queue = speech_for_updates.lock().await;
+                                                queue.push_back(notification.clone());
+                                                while queue.len() > 100 {
+                                                    queue.pop_front();
+                                                }
+                                            }
                                             let mut queue = notifications_for_updates.lock().await;
                                             queue.push_back(notification);
                                             while queue.len() > 100 {
@@ -1861,6 +1872,7 @@ async fn create_telegram_runtime() -> anyhow::Result<TelegramRuntime> {
         peer_ids,
         notifications,
         incoming_history,
+        speech_notifications,
         seen_incoming,
         auto_reply_history,
         auto_reply_cycle_history,
@@ -2196,6 +2208,7 @@ struct TelegramRuntime {
     peer_ids: Arc<tokio::sync::Mutex<HashMap<String, PeerId>>>,
     notifications: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
     incoming_history: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
+    speech_notifications: Arc<tokio::sync::Mutex<VecDeque<serde_json::Value>>>,
     seen_incoming: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<i32>>>>,
     auto_reply_history: Arc<tokio::sync::Mutex<HashMap<String, VecDeque<SystemTime>>>>,
     auto_reply_cycle_history:
@@ -2565,6 +2578,7 @@ struct AstraTelegramVoice {
     telegram: Arc<tokio::sync::Mutex<TelegramConnectionState>>,
     bot_shutdown: Arc<AtomicBool>,
     bot_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
+    speech_task: tokio::sync::Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Default for AstraTelegramVoice {
@@ -2573,6 +2587,7 @@ impl Default for AstraTelegramVoice {
             telegram: Arc::new(tokio::sync::Mutex::new(TelegramConnectionState::default())),
             bot_shutdown: Arc::new(AtomicBool::new(false)),
             bot_task: tokio::sync::Mutex::new(None),
+            speech_task: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -2588,6 +2603,81 @@ fn reconnect_delay(attempt: u32) -> std::time::Duration {
     std::time::Duration::from_secs(seconds)
 }
 
+async fn telegram_incoming_speech_loop(
+    ctx: PluginContext,
+    telegram: Arc<tokio::sync::Mutex<TelegramConnectionState>>,
+    stop: Arc<AtomicBool>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let settings = load_voice_settings().unwrap_or_default();
+        if !settings.message_assistant_enabled {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        }
+
+        // The worker owns its own queue and does not depend on an open UI tab.
+        let runtime = {
+            let mut state = telegram.lock().await;
+            let healthy = match state.runtime.as_ref() {
+                Some(runtime) => runtime.is_healthy().await,
+                None => false,
+            };
+            if !healthy {
+                if let Some(old) = state.runtime.take() {
+                    let _ = old.shutdown().await;
+                }
+                match create_telegram_runtime().await {
+                    Ok(runtime) => state.runtime = Some(Arc::new(runtime)),
+                    Err(error) => {
+                        eprintln!("Telegram speech worker could not start runtime: {error}");
+                        drop(state);
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                }
+            }
+            state.runtime.clone()
+        };
+
+        let Some(runtime) = runtime else {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            continue;
+        };
+        if !runtime.client.is_authorized().await.unwrap_or(false) {
+            tokio::time::sleep(Duration::from_secs(3)).await;
+            continue;
+        }
+
+        let item = runtime.speech_notifications.lock().await.pop_front();
+        let Some(item) = item else {
+            tokio::time::sleep(Duration::from_millis(700)).await;
+            continue;
+        };
+
+        let sender = item.get("sender").and_then(serde_json::Value::as_str)
+            .filter(|value| !value.trim().is_empty()).unwrap_or("неизвестный отправитель");
+        let body = item.get("text").and_then(serde_json::Value::as_str).unwrap_or("").trim();
+        let is_voice = item.get("is_voice").and_then(serde_json::Value::as_bool).unwrap_or(false);
+        let announcement = if !body.is_empty() {
+            format!("Новое сообщение от {sender}. {body}")
+        } else if is_voice {
+            format!("Новое сообщение от {sender}. Пришло голосовое сообщение.")
+        } else {
+            format!("Новое сообщение от {sender}. Сообщение без текста.")
+        };
+        let announcement: String = announcement.chars().take(1200).collect();
+        let voice_id = settings.astra_voice_id;
+        match ctx.daemon() {
+            Some(daemon) => {
+                if let Err(error) = daemon.speak(&announcement, &voice_id, true).await {
+                    eprintln!("Telegram incoming message TTS failed: {error}");
+                }
+            }
+            None => eprintln!("Telegram incoming message TTS unavailable: Astra daemon client is missing"),
+        }
+    }
+}
+
 #[astra::plugin]
 impl AstraTelegramVoice {
     #[hook]
@@ -2600,6 +2690,14 @@ impl AstraTelegramVoice {
             telegram_bot_poll_loop(ctx, telegram, stop).await;
         });
         *self.bot_task.lock().await = Some(task);
+
+        let speech_ctx = ctx.clone();
+        let speech_stop = self.bot_shutdown.clone();
+        let speech_telegram = self.telegram.clone();
+        let speech_task = tokio::spawn(async move {
+            telegram_incoming_speech_loop(speech_ctx, speech_telegram, speech_stop).await;
+        });
+        *self.speech_task.lock().await = Some(speech_task);
         Ok(())
     }
 
@@ -2607,6 +2705,9 @@ impl AstraTelegramVoice {
     async fn on_shutdown(&self, _ctx: &PluginContext) {
         self.bot_shutdown.store(true, Ordering::Relaxed);
         if let Some(task) = self.bot_task.lock().await.take() {
+            task.abort();
+        }
+        if let Some(task) = self.speech_task.lock().await.take() {
             task.abort();
         }
     }
